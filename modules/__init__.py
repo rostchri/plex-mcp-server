@@ -1,4 +1,6 @@
 import os
+import gc
+import ctypes
 import time
 import aiohttp
 from mcp.server.fastmcp import FastMCP # type: ignore
@@ -65,3 +67,12 @@ async def get_http_session() -> aiohttp.ClientSession:
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession()
     return _http_session
+
+
+def force_release_memory():
+    """Force CPython + glibc to return freed pages to the kernel."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass

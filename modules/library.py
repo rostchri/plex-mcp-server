@@ -1,8 +1,7 @@
-import gc
 import json
 import asyncio
 from plexapi.exceptions import NotFound # type: ignore
-from modules import mcp, connect_to_plex, get_http_session
+from modules import mcp, connect_to_plex, get_http_session, force_release_memory
 from urllib.parse import urljoin
 import time
 from typing import Optional, Union, List, Dict
@@ -126,6 +125,8 @@ async def library_get_stats(library_name: str) -> str:
                     for item in items:
                         yield item
                     offset += len(items)
+                    # Release the large response dict before fetching next batch
+                    del data, container, items
                     if offset >= total:
                         break
 
@@ -296,8 +297,7 @@ async def library_get_stats(library_name: str) -> str:
 
             return json.dumps(result)
         finally:
-            # Force GC to release memory arenas after large paginated operations
-            gc.collect()
+            force_release_memory()
 
     except Exception as e:
         return json.dumps({"error": f"Error getting library stats: {str(e)}"})
@@ -616,169 +616,172 @@ async def library_get_contents(
         headers = get_plex_headers(plex)
         session = await get_http_session()
 
-        # First get library sections
-        sections_url = urljoin(base_url, 'library/sections')
-        sections_data = await async_get_json(session, sections_url, headers)
+        try:
+            # First get library sections
+            sections_url = urljoin(base_url, 'library/sections')
+            sections_data = await async_get_json(session, sections_url, headers)
 
-        target_section = None
-        for section in sections_data['MediaContainer']['Directory']:
-            if section['title'].lower() == library_name.lower():
-                target_section = section
-                break
+            target_section = None
+            for section in sections_data['MediaContainer']['Directory']:
+                if section['title'].lower() == library_name.lower():
+                    target_section = section
+                    break
 
-        if not target_section:
-            return json.dumps({"error": f"Library '{library_name}' not found"})
+            if not target_section:
+                return json.dumps({"error": f"Library '{library_name}' not found"})
 
-        section_id = target_section['key']
-        library_type = target_section['type']
+            section_id = target_section['key']
+            library_type = target_section['type']
 
-        from urllib.parse import urlencode
+            from urllib.parse import urlencode
 
-        # Build query parameters for filtering and pagination
-        query_params = {
-            'start': offset,
-            'size': limit
-        }
-        if unwatched:
-            query_params['unwatched'] = '1'
-        elif watched:
-            query_params['unwatched'] = '0'
-        if sort:
-            query_params['sort'] = sort
+            # Build query parameters for filtering and pagination
+            query_params = {
+                'start': offset,
+                'size': limit
+            }
+            if unwatched:
+                query_params['unwatched'] = '1'
+            elif watched:
+                query_params['unwatched'] = '0'
+            if sort:
+                query_params['sort'] = sort
 
-        # Add advanced filters
-        if genre:
-            query_params['genre'] = genre
-        if year:
-            query_params['year'] = str(year)
-        if content_rating:
-            query_params['contentRating'] = content_rating
-        if director:
-            query_params['director'] = director
-        if actor:
-            query_params['actor'] = actor
-        if writer:
-            query_params['writer'] = writer
-        if resolution:
-            query_params['resolution'] = resolution
-        if network:
-            query_params['network'] = network
-        if studio:
-            query_params['studio'] = studio
+            # Add advanced filters
+            if genre:
+                query_params['genre'] = genre
+            if year:
+                query_params['year'] = str(year)
+            if content_rating:
+                query_params['contentRating'] = content_rating
+            if director:
+                query_params['director'] = director
+            if actor:
+                query_params['actor'] = actor
+            if writer:
+                query_params['writer'] = writer
+            if resolution:
+                query_params['resolution'] = resolution
+            if network:
+                query_params['network'] = network
+            if studio:
+                query_params['studio'] = studio
 
-        # Also set pagination headers which Plex often expects/supports
-        request_headers = headers.copy()
-        request_headers['X-Plex-Container-Start'] = str(offset)
-        request_headers['X-Plex-Container-Size'] = str(limit)
+            # Also set pagination headers which Plex often expects/supports
+            request_headers = headers.copy()
+            request_headers['X-Plex-Container-Start'] = str(offset)
+            request_headers['X-Plex-Container-Size'] = str(limit)
 
-        # Get items with filters and pagination
-        all_items_url = urljoin(base_url, f'library/sections/{section_id}/all?{urlencode(query_params)}')
-        all_data = await async_get_json(session, all_items_url, request_headers)
-        all_data = all_data['MediaContainer']
+            # Get items with filters and pagination
+            all_items_url = urljoin(base_url, f'library/sections/{section_id}/all?{urlencode(query_params)}')
+            all_data = await async_get_json(session, all_items_url, request_headers)
+            all_data = all_data['MediaContainer']
 
-        # Prepare the result
-        result = {
-            "name": target_section['title'],
-            "type": library_type,
-            "totalItems": all_data.get('totalSize', all_data.get('size', 0)),
-            "offset": offset,
-            "limit": limit,
-            "size": all_data.get('size', 0),
-            "items": []
-        }
+            # Prepare the result
+            result = {
+                "name": target_section['title'],
+                "type": library_type,
+                "totalItems": all_data.get('totalSize', all_data.get('size', 0)),
+                "offset": offset,
+                "limit": limit,
+                "size": all_data.get('size', 0),
+                "items": []
+            }
 
-        # Process items based on library type
-        if library_type == 'movie':
-            for item in all_data.get('Metadata', []):
-                year = item.get('year', 'Unknown')
-                duration = item.get('duration', 0)
-                hours, remainder = divmod(duration // 1000, 3600)
-                minutes, seconds = divmod(remainder, 60)
+            # Process items based on library type
+            if library_type == 'movie':
+                for item in all_data.get('Metadata', []):
+                    year = item.get('year', 'Unknown')
+                    duration = item.get('duration', 0)
+                    hours, remainder = divmod(duration // 1000, 3600)
+                    minutes, seconds = divmod(remainder, 60)
 
-                media_info = {}
-                if 'Media' in item:
-                    media = item['Media'][0] if item['Media'] else {}
-                    resolution = media.get('videoResolution', '')
-                    codec = media.get('videoCodec', '')
-                    if resolution and codec:
-                        media_info = {"resolution": resolution, "codec": codec}
+                    media_info = {}
+                    if 'Media' in item:
+                        media = item['Media'][0] if item['Media'] else {}
+                        resolution = media.get('videoResolution', '')
+                        codec = media.get('videoCodec', '')
+                        if resolution and codec:
+                            media_info = {"resolution": resolution, "codec": codec}
 
-                watched = item.get('viewCount', 0) > 0
+                    watched = item.get('viewCount', 0) > 0
 
-                result["items"].append({
-                    "title": item.get('title', ''),
-                    "year": year,
-                    "duration": {"hours": hours, "minutes": minutes},
-                    "mediaInfo": media_info,
-                    "watched": watched
-                })
+                    result["items"].append({
+                        "title": item.get('title', ''),
+                        "year": year,
+                        "duration": {"hours": hours, "minutes": minutes},
+                        "mediaInfo": media_info,
+                        "watched": watched
+                    })
 
-        elif library_type == 'show':
-            # childCount, leafCount and viewedLeafCount are already present
-            # in the /library/sections/{id}/all response — no per-show requests needed.
-            for item in all_data.get('Metadata', []):
-                year = item.get('year', 'Unknown')
-                season_count = item.get('childCount', 0)
-                episode_count = item.get('leafCount', 0)
-                watched_episodes = item.get('viewedLeafCount', 0)
-                watched = episode_count > 0 and watched_episodes == episode_count
+            elif library_type == 'show':
+                # childCount, leafCount and viewedLeafCount are already present
+                # in the /library/sections/{id}/all response — no per-show requests needed.
+                for item in all_data.get('Metadata', []):
+                    year = item.get('year', 'Unknown')
+                    season_count = item.get('childCount', 0)
+                    episode_count = item.get('leafCount', 0)
+                    watched_episodes = item.get('viewedLeafCount', 0)
+                    watched = episode_count > 0 and watched_episodes == episode_count
 
-                result["items"].append({
-                    "title": item.get('title', ''),
-                    "year": year,
-                    "seasonCount": season_count,
-                    "episodeCount": episode_count,
-                    "watched": watched
-                })
+                    result["items"].append({
+                        "title": item.get('title', ''),
+                        "year": year,
+                        "seasonCount": season_count,
+                        "episodeCount": episode_count,
+                        "watched": watched
+                    })
 
-        elif library_type == 'artist':
-            # Fetch all artists' tracks in parallel using asyncio.gather.
-            artists = all_data.get('Metadata', [])
+            elif library_type == 'artist':
+                # Fetch all artists' tracks in parallel using asyncio.gather.
+                artists = all_data.get('Metadata', [])
 
-            async def fetch_artist_tracks(artist):
-                artist_id = artist.get('ratingKey')
-                if not artist_id:
-                    return artist, {}
-                url = urljoin(base_url, f'library/sections/{section_id}/all?artist.id={artist_id}&type=10')
-                try:
-                    data = await async_get_json(session, url, headers)
-                    return artist, data
-                except Exception:
-                    return artist, {}
+                async def fetch_artist_tracks(artist):
+                    artist_id = artist.get('ratingKey')
+                    if not artist_id:
+                        return artist, {}
+                    url = urljoin(base_url, f'library/sections/{section_id}/all?artist.id={artist_id}&type=10')
+                    try:
+                        data = await async_get_json(session, url, headers)
+                        return artist, data
+                    except Exception:
+                        return artist, {}
 
-            artist_results = await asyncio.gather(*[fetch_artist_tracks(a) for a in artists])
+                artist_results = await asyncio.gather(*[fetch_artist_tracks(a) for a in artists])
 
-            for artist, tracks_data in artist_results:
-                artist_name = artist.get('title', '')
-                orig_view_count = artist.get('viewCount', 0)
-                orig_skip_count = artist.get('skipCount', 0)
+                for artist, tracks_data in artist_results:
+                    artist_name = artist.get('title', '')
+                    orig_view_count = artist.get('viewCount', 0)
+                    orig_skip_count = artist.get('skipCount', 0)
 
-                albums = set()
-                track_count = 0
-                view_count = 0
-                skip_count = 0
+                    albums = set()
+                    track_count = 0
+                    view_count = 0
+                    skip_count = 0
 
-                mc = tracks_data.get('MediaContainer', {})
-                for track in mc.get('Metadata', []):
-                    track_count += 1
-                    if track.get('parentTitle'):
-                        albums.add(track['parentTitle'])
-                    view_count += track.get('viewCount', 0)
-                    skip_count += track.get('skipCount', 0)
+                    mc = tracks_data.get('MediaContainer', {})
+                    for track in mc.get('Metadata', []):
+                        track_count += 1
+                        if track.get('parentTitle'):
+                            albums.add(track['parentTitle'])
+                        view_count += track.get('viewCount', 0)
+                        skip_count += track.get('skipCount', 0)
 
-                result["items"].append({
-                    "title": artist_name,
-                    "albumCount": len(albums),
-                    "trackCount": track_count,
-                    "viewCount": view_count if view_count > 0 else orig_view_count,
-                    "skipCount": skip_count if skip_count > 0 else orig_skip_count
-                })
+                    result["items"].append({
+                        "title": artist_name,
+                        "albumCount": len(albums),
+                        "trackCount": track_count,
+                        "viewCount": view_count if view_count > 0 else orig_view_count,
+                        "skipCount": skip_count if skip_count > 0 else orig_skip_count
+                    })
 
-        else:
-            for item in all_data.get('Metadata', []):
-                result["items"].append({"title": item.get('title', '')})
+            else:
+                for item in all_data.get('Metadata', []):
+                    result["items"].append({"title": item.get('title', '')})
 
-        return json.dumps(result)
+            return json.dumps(result)
+        finally:
+            force_release_memory()
 
     except Exception as e:
         return json.dumps({"error": f"Error getting library contents: {str(e)}"})
