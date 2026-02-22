@@ -3,6 +3,7 @@ from plexapi.server import PlexServer # type: ignore
 import os
 import json
 import time
+import aiohttp
 import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Union
@@ -426,91 +427,67 @@ async def user_get_watch_history(username: str = None, limit: int = 10, content_
         plex = connect_to_plex()
         account = plex.myPlexAccount()
         
-        # Track items we've already seen to avoid duplicates when expanding search
-        seen_item_ids = set()
         filtered_items = []
-        current_search_limit = limit * 2  # Start with 2x the requested limit
-        max_attempts = 4  # Maximum number of search expansions to prevent infinite loops
-        attempt = 0
-        
+
         # Determine which account ID to use
         target_account_id = None
         target_username = username
         is_owner = False
-        
+
         if user_id is not None:
-            # User ID provided directly
             target_account_id = user_id
-            # Check if this is the owner
             if user_id == account.id:
                 is_owner = True
                 target_username = account.username
                 # IMPORTANT: Owner's history uses accountID=1, not their real account ID
                 target_account_id = 1
             else:
-                # Try to find username for display purposes
                 for user in account.users():
                     if user.id == user_id:
                         target_username = user.title if hasattr(user, 'title') else user.username
                         break
         elif username and username.lower() != account.username.lower():
-            # Username provided (and not owner), need to look up the user
             target_user = None
             for user in account.users():
                 if user.username.lower() == username.lower() or (hasattr(user, 'title') and user.title.lower() == username.lower()):
                     target_user = user
                     break
-            
+
             if not target_user:
                 return json.dumps({"error": f"User '{username}' not found."})
-            
+
             target_account_id = target_user.id
         else:
-            # Username is None (implying owner) OR username matches owner
             is_owner = True
             target_username = account.username
             # IMPORTANT: Owner's history uses accountID=1, not their real account ID
             target_account_id = 1
-        
-        while len(filtered_items) < limit and attempt < max_attempts:
-            attempt += 1
-            
-            # Get history based on account ID
-            if target_account_id is None:
-                # Should not happen, but fallback to unfiltered
-                history_items = plex.history(maxresults=current_search_limit)
-            else:
-                # Specific user, filter by account ID
-                history_items = plex.history(maxresults=current_search_limit, accountID=target_account_id)
-            
-            # Filter by content type and deduplicate
-            for item in history_items:
-                item_id = getattr(item, 'ratingKey', None)
-                
-                # Skip if we've already processed this item
-                if item_id and item_id in seen_item_ids:
-                    continue
-                
-                # Add to seen items
-                if item_id:
-                    seen_item_ids.add(item_id)
-                
-                # Apply content type filter if specified
-                item_type = getattr(item, 'type', 'unknown')
-                if content_type and item_type.lower() != content_type.lower():
-                    continue
-                
-                filtered_items.append(item)
-                
-                # Stop if we've reached the limit
-                if len(filtered_items) >= limit:
-                    break
-            
-            # If we still need more items, double the search limit for next attempt
-            if len(filtered_items) < limit and history_items:
-                current_search_limit *= 2
-            else:
-                # Either we have enough items or there are no more to fetch
+
+        # Performance fix: fetch a single reasonable batch instead of exponential expansion.
+        # We request up to 10x the limit (capped at 500) to accommodate content-type filtering,
+        # then filter client-side. This replaces the previous loop that could fetch up to 16x
+        # the requested limit across 4 attempts.
+        fetch_limit = min(limit * 10, 500)
+
+        if target_account_id is None:
+            history_items = plex.history(maxresults=fetch_limit)
+        else:
+            history_items = plex.history(maxresults=fetch_limit, accountID=target_account_id)
+
+        seen_item_ids = set()
+        for item in history_items:
+            item_id = getattr(item, 'ratingKey', None)
+            if item_id and item_id in seen_item_ids:
+                continue
+            if item_id:
+                seen_item_ids.add(item_id)
+
+            item_type = getattr(item, 'type', 'unknown')
+            if content_type and item_type.lower() != content_type.lower():
+                continue
+
+            filtered_items.append(item)
+            if len(filtered_items) >= limit:
                 break
         
         # If we couldn't find any matching items
@@ -599,12 +576,13 @@ async def user_get_statistics(time_period: str = "last_24_hours", username: str 
             'Accept': 'application/json'
         }
         
-        # Make the request to get statistics
-        response = requests.get(stats_url, headers=headers)
-        if response.status_code != 200:
-            return json.dumps({"error": f"Failed to fetch statistics: HTTP {response.status_code}"})
-        
-        data = response.json()
+        # Performance fix: use aiohttp instead of blocking requests.get to avoid
+        # stalling the event loop during the HTTP request.
+        async with aiohttp.ClientSession() as session:
+            async with session.get(stats_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status != 200:
+                    return json.dumps({"error": f"Failed to fetch statistics: HTTP {response.status}"})
+                data = await response.json(content_type=None)
         
         # Get data from response
         container = data.get('MediaContainer', {})

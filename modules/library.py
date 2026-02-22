@@ -56,86 +56,115 @@ async def library_list() -> str:
 @mcp.tool()
 async def library_get_stats(library_name: str) -> str:
     """Get statistics for a specific library.
-    
+
     Args:
         library_name: Name of the library to get stats for
     """
+    BATCH_SIZE = 500
+
     try:
         plex = connect_to_plex()
         base_url = plex._baseurl
         headers = get_plex_headers(plex)
-        
+
         async with aiohttp.ClientSession() as session:
             # First get library sections
             sections_url = urljoin(base_url, 'library/sections')
             sections_data = await async_get_json(session, sections_url, headers)
-            
+
             target_section = None
             for section in sections_data['MediaContainer']['Directory']:
                 if section['title'].lower() == library_name.lower():
                     target_section = section
                     break
-                    
+
             if not target_section:
                 return json.dumps({"error": f"Library '{library_name}' not found"})
-                
+
             section_id = target_section['key']
             library_type = target_section['type']
-            
+
             # Create base result
             result = {
                 "name": target_section['title'],
                 "type": library_type,
                 "totalItems": target_section.get('totalSize', 0)
             }
-            
-            # Prepare URLs for concurrent requests
-            all_items_url = urljoin(base_url, f'library/sections/{section_id}/all')
-            unwatched_url = urljoin(base_url, f'library/sections/{section_id}/all?unwatched=1')
-            
-            # Make concurrent requests for all and unwatched items
-            all_data, unwatched_data = await asyncio.gather(
-                async_get_json(session, all_items_url, headers),
-                async_get_json(session, unwatched_url, headers)
-            )
-            all_data = all_data['MediaContainer']
-            unwatched_data = unwatched_data['MediaContainer']
-            
+
+            # Helper: get count from endpoint without loading metadata.
+            # Uses both query params (start/size) AND headers (X-Plex-Container-*)
+            # to ensure Plex respects pagination. Requests only 1 item.
+            async def get_count(url):
+                sep = '&' if '?' in url else '?'
+                count_url = f"{url}{sep}start=0&size=1"
+                h = headers.copy()
+                h['X-Plex-Container-Start'] = '0'
+                h['X-Plex-Container-Size'] = '1'
+                data = await async_get_json(session, count_url, h)
+                mc = data['MediaContainer']
+                return mc.get('totalSize', mc.get('size', 0))
+
+            # Helper: async generator that yields items in paginated batches.
+            # Mirrors the proven approach from library_get_contents: both
+            # query params (start/size) AND headers (X-Plex-Container-*).
+            async def iter_pages(url, batch_size=BATCH_SIZE):
+                offset = 0
+                total = None
+                while True:
+                    sep = '&' if '?' in url else '?'
+                    page_url = f"{url}{sep}start={offset}&size={batch_size}"
+                    h = headers.copy()
+                    h['X-Plex-Container-Start'] = str(offset)
+                    h['X-Plex-Container-Size'] = str(batch_size)
+                    data = await async_get_json(session, page_url, h)
+                    container = data['MediaContainer']
+                    if total is None:
+                        total = container.get('totalSize', container.get('size', 0))
+                    items = container.get('Metadata', [])
+                    if not items:
+                        break
+                    for item in items:
+                        yield item
+                    offset += len(items)
+                    if offset >= total:
+                        break
+
+            all_url = urljoin(base_url, f'library/sections/{section_id}/all')
+            unwatched_url = f"{all_url}?unwatched=1"
+
             if library_type == 'movie':
+                # Get counts with size=0 — no metadata loaded into memory
+                total_count, unwatched_count = await asyncio.gather(
+                    get_count(all_url),
+                    get_count(unwatched_url)
+                )
+
                 movie_stats = {
-                    "count": all_data.get('size', 0),
-                    "unwatched": unwatched_data.get('size', 0)
+                    "count": total_count,
+                    "unwatched": unwatched_count
                 }
-                
-                # Get genres, directors, studios stats
+
+                # Aggregate stats by paginating through items in batches
                 genres = {}
                 directors = {}
                 studios = {}
                 decades = {}
-                
-                for movie in all_data.get('Metadata', []):
-                    # Process genres
+
+                async for movie in iter_pages(all_url):
                     for genre in movie.get('Genre', []):
-                        genre_name = genre['tag']
-                        genres[genre_name] = genres.get(genre_name, 0) + 1
-                    
-                    # Process directors
+                        g = genre['tag']
+                        genres[g] = genres.get(g, 0) + 1
                     for director in movie.get('Director', []):
-                        director_name = director['tag']
-                        directors[director_name] = directors.get(director_name, 0) + 1
-                    
-                    # Process studios
+                        d = director['tag']
+                        directors[d] = directors.get(d, 0) + 1
                     studio = movie.get('studio')
                     if studio:
                         studios[studio] = studios.get(studio, 0) + 1
-                    
-                    # Process decades
                     year = movie.get('year')
                     if year:
                         decade = (year // 10) * 10
                         decades[decade] = decades.get(decade, 0) + 1
-                
-                # Add top items to results
+
                 if genres:
                     movie_stats["topGenres"] = dict(sorted(genres.items(), key=lambda x: x[1], reverse=True)[:5])
                 if directors:
@@ -144,140 +173,114 @@ async def library_get_stats(library_name: str) -> str:
                     movie_stats["topStudios"] = dict(sorted(studios.items(), key=lambda x: x[1], reverse=True)[:5])
                 if decades:
                     movie_stats["byDecade"] = dict(sorted(decades.items()))
-                
+
                 result["movieStats"] = movie_stats
-                
+
             elif library_type == 'show':
-                # Prepare URLs for concurrent requests
-                seasons_url = urljoin(base_url, f'library/sections/{section_id}/all?type=3')
-                episodes_url = urljoin(base_url, f'library/sections/{section_id}/all?type=4')
-                
-                # Make concurrent requests for seasons and episodes
-                seasons_data, episodes_data = await asyncio.gather(
-                    async_get_json(session, seasons_url, headers),
-                    async_get_json(session, episodes_url, headers)
+                seasons_url = f"{all_url}?type=3"
+                episodes_url = f"{all_url}?type=4"
+
+                # Get all counts with size=0 — no metadata loaded
+                total_count, unwatched_count, season_count, episode_count = await asyncio.gather(
+                    get_count(all_url),
+                    get_count(unwatched_url),
+                    get_count(seasons_url),
+                    get_count(episodes_url)
                 )
-                seasons_data = seasons_data['MediaContainer']
-                episodes_data = episodes_data['MediaContainer']
-                
-                # Process show stats
+
+                # Aggregate show-level stats by paginating through shows
                 genres = {}
                 studios = {}
                 decades = {}
-                
-                for show in all_data.get('Metadata', []):
-                    # Process genres
+
+                async for show in iter_pages(all_url):
                     for genre in show.get('Genre', []):
-                        genre_name = genre['tag']
-                        genres[genre_name] = genres.get(genre_name, 0) + 1
-                    
-                    # Process studios
+                        g = genre['tag']
+                        genres[g] = genres.get(g, 0) + 1
                     studio = show.get('studio')
                     if studio:
                         studios[studio] = studios.get(studio, 0) + 1
-                    
-                    # Process decades
                     year = show.get('year')
                     if year:
                         decade = (year // 10) * 10
                         decades[decade] = decades.get(decade, 0) + 1
-                
+
                 show_stats = {
-                    "shows": all_data.get('size', 0),
-                    "seasons": seasons_data.get('size', 0),
-                    "episodes": episodes_data.get('size', 0),
-                    "unwatchedShows": unwatched_data.get('size', 0)
+                    "shows": total_count,
+                    "seasons": season_count,
+                    "episodes": episode_count,
+                    "unwatchedShows": unwatched_count
                 }
-                
-                # Add top items to results
+
                 if genres:
                     show_stats["topGenres"] = dict(sorted(genres.items(), key=lambda x: x[1], reverse=True)[:5])
                 if studios:
                     show_stats["topStudios"] = dict(sorted(studios.items(), key=lambda x: x[1], reverse=True)[:5])
                 if decades:
                     show_stats["byDecade"] = dict(sorted(decades.items()))
-                
+
                 result["showStats"] = show_stats
-                
+
             elif library_type == 'artist':
-                # Initialize statistics
+                tracks_url = f"{all_url}?type=10"
+
+                # Get counts with size=0
+                artist_count, track_count = await asyncio.gather(
+                    get_count(all_url),
+                    get_count(tracks_url)
+                )
+
                 artist_stats = {
-                    "count": all_data.get('size', 0),
-                    "totalTracks": 0,
+                    "count": artist_count,
+                    "totalTracks": track_count,
                     "totalAlbums": 0,
                     "totalPlays": 0
                 }
-                
-                # Track data for statistics
+
                 all_genres = {}
                 all_years = {}
-                top_artists = {}
                 top_albums = {}
                 audio_formats = {}
-                
-                # Process artists one by one for accurate stats
-                for artist in all_data.get('Metadata', []):
-                    artist_id = artist.get('ratingKey')
-                    artist_name = artist.get('title', '')
-                    
-                    if not artist_id:
-                        continue
-                    
-                    # Store artist views for top artists calculation
-                    artist_view_count = 0
-                    artist_albums = set()
-                    artist_track_count = 0
-                    
-                    # Get tracks directly for this artist
-                    artist_tracks_url = urljoin(base_url, f'library/sections/{section_id}/all?artist.id={artist_id}&type=10')
-                    artist_tracks_data = await async_get_json(session, artist_tracks_url, headers)
-                    
-                    if 'MediaContainer' in artist_tracks_data and 'Metadata' in artist_tracks_data['MediaContainer']:
-                        for track in artist_tracks_data['MediaContainer']['Metadata']:
-                            # Count total tracks
-                            artist_track_count += 1
-                            
-                            # Count track views for this artist
-                            track_views = track.get('viewCount', 0)
-                            artist_view_count += track_views
-                            artist_stats["totalPlays"] += track_views
-                            
-                            # Add album to set
-                            album_title = track.get('parentTitle')
-                            if album_title:
-                                artist_albums.add(album_title)
-                                
-                                # Track album plays for top albums
-                                album_key = f"{artist_name} - {album_title}"
-                                if album_key not in top_albums:
-                                    top_albums[album_key] = 0
-                                top_albums[album_key] += track_views
-                            
-                            # Process genres if available
-                            if 'Genre' in track:
-                                for genre in track.get('Genre', []):
-                                    genre_name = genre['tag']
-                                    all_genres[genre_name] = all_genres.get(genre_name, 0) + 1
-                            
-                            # Process years instead of decades
-                            year = track.get('parentYear') or track.get('year')
-                            if year:
-                                all_years[year] = all_years.get(year, 0) + 1
-                            
-                            # Track audio formats
-                            if 'Media' in track and track['Media'] and 'audioCodec' in track['Media'][0]:
-                                audio_codec = track['Media'][0]['audioCodec']
-                                audio_formats[audio_codec] = audio_formats.get(audio_codec, 0) + 1
-                    
-                    # Update top artists
-                    if artist_track_count > 0:
-                        top_artists[artist_name] = artist_view_count
-                    
-                    # Update totals
-                    artist_stats["totalTracks"] += artist_track_count
-                    artist_stats["totalAlbums"] += len(artist_albums)
-                
-                # Add top items to results
+                artist_albums = {}
+                artist_plays = {}
+
+                # Paginate through tracks in batches
+                async for track in iter_pages(tracks_url):
+                    artist_name = track.get('grandparentTitle', 'Unknown')
+                    album_title = track.get('parentTitle', '')
+                    track_views = track.get('viewCount', 0)
+
+                    artist_stats["totalPlays"] += track_views
+
+                    if artist_name not in artist_albums:
+                        artist_albums[artist_name] = set()
+                        artist_plays[artist_name] = 0
+                    if album_title:
+                        artist_albums[artist_name].add(album_title)
+                    artist_plays[artist_name] += track_views
+
+                    if album_title:
+                        album_key = f"{artist_name} - {album_title}"
+                        top_albums[album_key] = top_albums.get(album_key, 0) + track_views
+
+                    for genre in track.get('Genre', []):
+                        g = genre['tag']
+                        all_genres[g] = all_genres.get(g, 0) + 1
+
+                    year = track.get('parentYear') or track.get('year')
+                    if year:
+                        all_years[year] = all_years.get(year, 0) + 1
+
+                    if track.get('Media') and track['Media']:
+                        codec = track['Media'][0].get('audioCodec')
+                        if codec:
+                            audio_formats[codec] = audio_formats.get(codec, 0) + 1
+
+                for artist_name, albums in artist_albums.items():
+                    artist_stats["totalAlbums"] += len(albums)
+
+                top_artists = {name: artist_plays.get(name, 0) for name in artist_albums}
+
                 if all_genres:
                     artist_stats["topGenres"] = dict(sorted(all_genres.items(), key=lambda x: x[1], reverse=True)[:10])
                 if top_artists:
@@ -288,11 +291,11 @@ async def library_get_stats(library_name: str) -> str:
                     artist_stats["byYear"] = dict(sorted(all_years.items()))
                 if audio_formats:
                     artist_stats["audioFormats"] = audio_formats
-                
+
                 result["musicStats"] = artist_stats
-            
+
             return json.dumps(result)
-            
+
     except Exception as e:
         return json.dumps({"error": f"Error getting library stats: {str(e)}"})
 
@@ -718,23 +721,16 @@ async def library_get_contents(
                     })
             
             elif library_type == 'show':
-                # Get all shows metadata in parallel
-                show_urls = [
-                    (item["ratingKey"], urljoin(base_url, f'library/metadata/{item["ratingKey"]}'))
-                    for item in all_data.get('Metadata', [])
-                ]
-                show_responses = await asyncio.gather(
-                    *[async_get_json(session, url, headers) for _, url in show_urls]
-                )
-                
-                for item, show_data in zip(all_data.get('Metadata', []), show_responses):
-                    show_data = show_data['MediaContainer']['Metadata'][0]
-                    
+                # Performance fix: childCount, leafCount and viewedLeafCount are already
+                # present in the /library/sections/{id}/all response — no per-show
+                # metadata requests needed.
+                for item in all_data.get('Metadata', []):
                     year = item.get('year', 'Unknown')
-                    season_count = show_data.get('childCount', 0)
-                    episode_count = show_data.get('leafCount', 0)
-                    watched = episode_count > 0 and show_data.get('viewedLeafCount', 0) == episode_count
-                    
+                    season_count = item.get('childCount', 0)
+                    episode_count = item.get('leafCount', 0)
+                    watched_episodes = item.get('viewedLeafCount', 0)
+                    watched = episode_count > 0 and watched_episodes == episode_count
+
                     result["items"].append({
                         "title": item.get('title', ''),
                         "year": year,
@@ -744,62 +740,47 @@ async def library_get_contents(
                     })
             
             elif library_type == 'artist':
-                # Process artists one by one for more accurate track/album counting
-                artists_info = {}
-                
-                for artist in all_data.get('Metadata', []):
+                # Performance fix: fetch all artists' tracks in parallel using
+                # asyncio.gather instead of sequential per-artist requests.
+                artists = all_data.get('Metadata', [])
+
+                async def fetch_artist_tracks(artist):
                     artist_id = artist.get('ratingKey')
-                    artist_name = artist.get('title', '')
-                    
                     if not artist_id:
-                        continue
-                    
-                    # Store the original artist viewCount and skipCount as fallback
+                        return artist, {}
+                    url = urljoin(base_url, f'library/sections/{section_id}/all?artist.id={artist_id}&type=10')
+                    try:
+                        data = await async_get_json(session, url, headers)
+                        return artist, data
+                    except Exception:
+                        return artist, {}
+
+                artist_results = await asyncio.gather(*[fetch_artist_tracks(a) for a in artists])
+
+                for artist, tracks_data in artist_results:
+                    artist_name = artist.get('title', '')
                     orig_view_count = artist.get('viewCount', 0)
                     orig_skip_count = artist.get('skipCount', 0)
-                    
-                    # Get tracks directly for this artist
-                    artist_tracks_url = urljoin(base_url, f'library/sections/{section_id}/all?artist.id={artist_id}&type=10')
-                    artist_tracks_data = await async_get_json(session, artist_tracks_url, headers)
-                    
-                    # Initialize artist data
-                    if artist_name not in artists_info:
-                        artists_info[artist_name] = {
-                            "title": artist_name,
-                            "albums": set(),
-                            "trackCount": 0,
-                            "viewCount": 0,
-                            "skipCount": 0
-                        }
-                    
-                    # Count tracks and albums from the track-level data
-                    track_view_count = 0
-                    track_skip_count = 0
-                    if 'MediaContainer' in artist_tracks_data and 'Metadata' in artist_tracks_data['MediaContainer']:
-                        for track in artist_tracks_data['MediaContainer']['Metadata']:
-                            # Count each track
-                            artists_info[artist_name]["trackCount"] += 1
-                            
-                            # Add album to set (to get unique album count)
-                            if 'parentTitle' in track and track['parentTitle']:
-                                artists_info[artist_name]["albums"].add(track['parentTitle'])
-                            
-                            # Count views and skips
-                            track_view_count += track.get('viewCount', 0)
-                            track_skip_count += track.get('skipCount', 0)
-                    
-                    # Use the sum of track counts if they're non-zero, otherwise fall back to artist level counts
-                    artists_info[artist_name]["viewCount"] = track_view_count if track_view_count > 0 else orig_view_count
-                    artists_info[artist_name]["skipCount"] = track_skip_count if track_skip_count > 0 else orig_skip_count
-                
-                # Convert album sets to counts and add to results
-                for artist_name, info in artists_info.items():
+
+                    albums = set()
+                    track_count = 0
+                    view_count = 0
+                    skip_count = 0
+
+                    mc = tracks_data.get('MediaContainer', {})
+                    for track in mc.get('Metadata', []):
+                        track_count += 1
+                        if track.get('parentTitle'):
+                            albums.add(track['parentTitle'])
+                        view_count += track.get('viewCount', 0)
+                        skip_count += track.get('skipCount', 0)
+
                     result["items"].append({
-                        "title": info["title"],
-                        "albumCount": len(info["albums"]),
-                        "trackCount": info["trackCount"],
-                        "viewCount": info["viewCount"],
-                        "skipCount": info["skipCount"]
+                        "title": artist_name,
+                        "albumCount": len(albums),
+                        "trackCount": track_count,
+                        "viewCount": view_count if view_count > 0 else orig_view_count,
+                        "skipCount": skip_count if skip_count > 0 else orig_skip_count
                     })
             
             else:
