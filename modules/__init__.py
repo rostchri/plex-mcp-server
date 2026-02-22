@@ -1,5 +1,6 @@
 import os
 import time
+import aiohttp
 from mcp.server.fastmcp import FastMCP # type: ignore
 from plexapi.server import PlexServer # type: ignore
 from plexapi.myplex import MyPlexAccount # type: ignore
@@ -18,47 +19,49 @@ CONNECTION_TIMEOUT = 30  # seconds
 SESSION_TIMEOUT = 60 * 30  # 30 minutes
 
 def connect_to_plex() -> PlexServer:
-    """Connect to Plex server using environment variables or stored credentials.
-    
-    Returns a PlexServer instance with automatic reconnection if needed.
+    """Connect to Plex server, reusing a cached singleton instance.
+
+    Returns a PlexServer instance. Reconnects only when the session has
+    expired (SESSION_TIMEOUT) or was never created. Avoids per-call API
+    verification to reduce overhead and memory churn.
     """
     global server, last_connection_time
     current_time = time.time()
-    
-    # Check if we have a valid connection
-    if server is not None:
-        # If we've connected recently, reuse the connection
-        if current_time - last_connection_time < SESSION_TIMEOUT:
-            # Verify the connection is still alive with a simple request
-            try:
-                # Simple API call to verify the connection
-                server.library.sections()
-                last_connection_time = current_time
-                return server
-            except:
-                # Connection failed, reset and create a new one
-                server = None
-    
-    # Create a new connection
+
+    # Reuse existing connection if still within timeout window
+    if server is not None and (current_time - last_connection_time) < SESSION_TIMEOUT:
+        return server
+
+    # Create a new connection (or reconnect after timeout)
+    server = None
     max_retries = 3
     retry_delay = 2  # seconds
-    
+
     for attempt in range(max_retries):
         try:
-            # Connect directly with URL and token
             if not plex_url or not plex_token:
                 raise ValueError("PLEX_URL and PLEX_TOKEN are required")
-            
+
             server = PlexServer(plex_url, plex_token, timeout=CONNECTION_TIMEOUT)
             last_connection_time = current_time
             return server
-            
+
         except Exception as e:
-            if attempt == max_retries - 1:  # Last attempt failed
+            if attempt == max_retries - 1:
                 raise ValueError(f"Failed to connect to Plex after {max_retries} attempts: {str(e)}")
-            
-            # Wait before retrying
             time.sleep(retry_delay)
-    
-    # We shouldn't get here but just in case
+
     raise ValueError("Failed to connect to Plex server")
+
+
+# Shared aiohttp session — avoids per-request connection pool and SSL context
+# allocation. Lazy-initialized on first use.
+_http_session: aiohttp.ClientSession | None = None
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Return a shared aiohttp.ClientSession, creating one if needed."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session

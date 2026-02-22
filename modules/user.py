@@ -1,10 +1,8 @@
-from modules import mcp, connect_to_plex
+from modules import mcp, connect_to_plex, get_http_session
 from plexapi.server import PlexServer # type: ignore
 import os
 import json
 import time
-import aiohttp
-import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Union
 
@@ -576,13 +574,13 @@ async def user_get_statistics(time_period: str = "last_24_hours", username: str 
             'Accept': 'application/json'
         }
         
-        # Performance fix: use aiohttp instead of blocking requests.get to avoid
-        # stalling the event loop during the HTTP request.
-        async with aiohttp.ClientSession() as session:
-            async with session.get(stats_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                if response.status != 200:
-                    return json.dumps({"error": f"Failed to fetch statistics: HTTP {response.status}"})
-                data = await response.json(content_type=None)
+        # Use shared aiohttp session to avoid per-request connection pool allocation.
+        import aiohttp
+        session = await get_http_session()
+        async with session.get(stats_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                return json.dumps({"error": f"Failed to fetch statistics: HTTP {response.status}"})
+            data = await response.json(content_type=None)
         
         # Get data from response
         container = data.get('MediaContainer', {})
